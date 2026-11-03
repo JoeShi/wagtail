@@ -1,0 +1,18 @@
+{% extends "wagtailadmin/base.html" %}
+{% load i18n %}
+{% block titletag %}{% trans "Delete saved filter" %}{% endblock %}
+{% block bodyclass %}menu-explorer{% endblock %}
+
+{% block content %}
+    {% trans "Delete saved filter" as page_title %}
+    {% include "wagtailadmin/shared/header.html" with title=page_title subtitle=form_page.title icon="form" %}
+    <div class="nice-padding">
+        <p>{% blocktrans trimmed with name=filter_preset.name %}Are you sure you want to delete the saved filter “{{ name }}”? Form submissions will not be deleted.{% endblocktrans %}</p>
+        <form action="" method="post">
+            {% csrf_token %}
+            <input type="hidden" name="next" value="{{ next_url }}">
+            <button type="submit" class="button serious">{% trans "Delete" %}</button>
+            <a href="{{ next_url }}" class="button button-secondary">{% trans "Cancel" %}</a>
+        </form>
+    </div>
+{% endblock %}

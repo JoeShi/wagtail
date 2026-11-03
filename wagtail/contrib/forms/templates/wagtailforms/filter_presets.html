@@ -1,0 +1,47 @@
+{% load i18n %}
+<div class="nice-padding" id="saved-filters">
+    <details>
+        <summary>{% trans "Saved filters" %}</summary>
+        {% if filter_preset_initial %}
+            <form action="{% url 'wagtailforms:save_filter_preset' form_page.pk %}" method="post">
+                {% csrf_token %}
+                <input type="hidden" name="next" value="{{ next_url }}">
+                <input type="hidden" name="date_from" value="{{ filter_preset_initial.date_from|date:'Y-m-d' }}">
+                <input type="hidden" name="date_to" value="{{ filter_preset_initial.date_to|date:'Y-m-d' }}">
+                {% for ordering in filter_preset_initial.ordering %}
+                    <input type="hidden" name="order_by" value="{{ ordering }}">
+                {% endfor %}
+                <label for="id_filter_preset_name">{% trans "Filter name" %}</label>
+                <input type="text" id="id_filter_preset_name" name="name" maxlength="255" required>
+                <button type="submit" class="button">{% trans "Save current filter" %}</button>
+            </form>
+        {% else %}
+            <p>{% trans "Correct the current filter errors before saving this filter." %}</p>
+        {% endif %}
+
+        {% if filter_presets %}
+            <ul>
+                {% for preset in filter_presets %}
+                    <li>
+                        <strong>{{ preset.name }}</strong>
+                        <span>
+                            {% if preset.date_from or preset.date_to %}
+                                {% if preset.date_from %}{{ preset.date_from|date:'Y-m-d' }}{% else %}{% trans "Any start date" %}{% endif %}
+                                –
+                                {% if preset.date_to %}{{ preset.date_to|date:'Y-m-d' }}{% else %}{% trans "Any end date" %}{% endif %}
+                            {% else %}
+                                {% trans "Any date" %}
+                            {% endif %}
+                        </span>
+                        <span>{{ preset.ordering|join:", " }}</span>
+                        <a href="{% url 'wagtailforms:apply_filter_preset' form_page.pk preset.pk %}">{% trans "Apply" %}</a>
+                        <a href="{% url 'wagtailforms:rename_filter_preset' form_page.pk preset.pk %}?next={{ next_url|urlencode }}">{% trans "Rename" %}</a>
+                        <a href="{% url 'wagtailforms:delete_filter_preset' form_page.pk preset.pk %}?next={{ next_url|urlencode }}">{% trans "Delete" %}</a>
+                    </li>
+                {% endfor %}
+            </ul>
+        {% else %}
+            <p>{% trans "You have no saved filters for this form." %}</p>
+        {% endif %}
+    </details>
+</div>

@@ -15,6 +15,7 @@ from wagtail.api import APIField
 from wagtail.contrib.forms.utils import get_field_clean_name
 from wagtail.models import Orderable, Page
 
+from .filter_presets import FormSubmissionFilterPreset as FormSubmissionFilterPreset
 from .forms import FormBuilder, WagtailAdminFormPageForm
 
 swapper.set_app_prefix("wagtailcore", "wagtail")

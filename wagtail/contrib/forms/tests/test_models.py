@@ -1,8 +1,11 @@
+import datetime
+
 from django.core import mail
 from django.core.exceptions import ValidationError
+from django.db import IntegrityError, transaction
 from django.test import TestCase, override_settings
 
-from wagtail.contrib.forms.models import FormSubmission
+from wagtail.contrib.forms.models import FormSubmission, FormSubmissionFilterPreset
 from wagtail.contrib.forms.tests.utils import (
     make_form_page,
     make_form_page_with_custom_submission,
@@ -193,6 +196,56 @@ class TestFormSubmission(TestCase):
 
         submission = FormSubmission.objects.first()
         self.assertIn("hello world", str(submission))
+
+
+class TestFormSubmissionFilterPreset(WagtailTestUtils, TestCase):
+    def setUp(self):
+        self.form_page = make_form_page()
+        self.other_form_page = make_form_page(slug="other-form-page")
+        self.user = self.create_user(username="preset-user")
+        self.other_user = self.create_user(username="other-preset-user")
+
+    def make_preset(self, **kwargs):
+        kwargs.setdefault("user", self.user)
+        kwargs.setdefault("page", self.form_page)
+        kwargs.setdefault("name", "January")
+        kwargs.setdefault("ordering", ["-submit_time"])
+        return FormSubmissionFilterPreset.objects.create(**kwargs)
+
+    def test_fields_are_persisted(self):
+        preset = self.make_preset(
+            date_from=datetime.date(2026, 1, 2),
+            date_to=datetime.date(2026, 1, 4),
+            ordering=["id", "-submit_time"],
+        )
+        preset.refresh_from_db()
+        self.assertEqual(preset.user, self.user)
+        self.assertEqual(preset.page.specific, self.form_page)
+        self.assertEqual(preset.name, "January")
+        self.assertEqual(preset.date_from, datetime.date(2026, 1, 2))
+        self.assertEqual(preset.date_to, datetime.date(2026, 1, 4))
+        self.assertEqual(preset.ordering, ["id", "-submit_time"])
+
+    def test_name_is_unique_per_user_and_page(self):
+        preset = self.make_preset()
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            self.make_preset()
+
+        other_preset = self.make_preset(name="February")
+        preset.name = other_preset.name
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            preset.save()
+
+        self.make_preset(page=self.other_form_page)
+        self.make_preset(user=self.other_user)
+        self.assertEqual(FormSubmissionFilterPreset.objects.count(), 4)
+
+    def test_deleting_preset_does_not_delete_submissions(self):
+        submission = FormSubmission.objects.create(
+            page=self.form_page, form_data={"your_message": "Keep me"}
+        )
+        self.make_preset().delete()
+        self.assertTrue(FormSubmission.objects.filter(pk=submission.pk).exists())
 
 
 class TestFormWithCustomSubmission(WagtailTestUtils, TestCase):

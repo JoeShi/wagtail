@@ -4,14 +4,16 @@ from collections import OrderedDict
 import swapper
 from django.contrib.admin.utils import quote
 from django.contrib.contenttypes.models import ContentType
-from django.core.exceptions import PermissionDenied
+from django.core.exceptions import PermissionDenied, ValidationError
+from django.db import IntegrityError, transaction
 from django.forms import CheckboxSelectMultiple
-from django.http import Http404
+from django.http import Http404, HttpResponseRedirect, QueryDict
 from django.shortcuts import get_object_or_404, redirect
+from django.template.response import TemplateResponse
 from django.urls import reverse
 from django.utils.functional import classproperty
 from django.utils.translation import gettext, gettext_lazy, ngettext
-from django.views.generic import TemplateView
+from django.views.generic import TemplateView, View
 from django_filters import DateFromToRangeFilter
 
 from wagtail.admin import messages
@@ -26,7 +28,12 @@ from wagtail.admin.views.generic import PermissionCheckedMixin
 from wagtail.admin.views.generic.base import BaseListingView
 from wagtail.admin.views.mixins import SpreadsheetExportMixin
 from wagtail.admin.views.pages.listing import PageFilterSet, PageListingMixin
-from wagtail.contrib.forms.models import FormMixin
+from wagtail.contrib.forms.forms import (
+    FormSubmissionFilterPresetForm,
+    FormSubmissionFilterPresetRenameForm,
+    validate_ordering_values,
+)
+from wagtail.contrib.forms.models import FormMixin, FormSubmissionFilterPreset
 from wagtail.contrib.forms.utils import get_form_types, get_forms_for_user
 
 Page = swapper.load_model("wagtailcore", "Page")
@@ -192,6 +199,173 @@ class DeleteSubmissionsView(TemplateView):
         context["next_url"] = self.get_success_url()
 
         return context
+
+
+class FormSubmissionFilterPresetViewMixin:
+    """Resolve a form page and scope presets to the current user and page."""
+
+    filter_preset = None
+
+    def dispatch(self, request, *args, **kwargs):
+        self.form_page = get_object_or_404(Page, id=kwargs["page_id"]).specific
+        if not isinstance(self.form_page, FormMixin):
+            raise Http404
+        if not get_forms_for_user(request.user).filter(pk=self.form_page.pk).exists():
+            raise PermissionDenied
+        if "preset_id" in kwargs:
+            self.filter_preset = get_object_or_404(
+                self.get_presets(), pk=kwargs["preset_id"]
+            )
+        return super().dispatch(request, *args, **kwargs)
+
+    def get_presets(self):
+        return FormSubmissionFilterPreset.objects.filter(
+            user=self.request.user, page=self.form_page
+        )
+
+    def get_ordering_configuration(self):
+        view_class = self.form_page.get_submissions_list_view_class()
+        return {
+            "orderable_fields": view_class.orderable_fields,
+            "default_ordering": view_class.default_ordering,
+        }
+
+    def get_success_url(self):
+        return get_valid_next_url_from_request(self.request) or reverse(
+            "wagtailforms:list_submissions", args=(self.form_page.pk,)
+        )
+
+    def get_form_kwargs(self):
+        return {
+            "user": self.request.user,
+            "page": self.form_page,
+            **self.get_ordering_configuration(),
+        }
+
+    def get_context_data(self, **kwargs):
+        return {
+            "form_page": self.form_page,
+            "filter_preset": self.filter_preset,
+            "next_url": self.get_success_url(),
+            **kwargs,
+        }
+
+    def render_form(self, form):
+        return TemplateResponse(
+            self.request,
+            "wagtailforms/filter_preset_form.html",
+            self.get_context_data(form=form),
+        )
+
+    def save_form(self, form):
+        try:
+            with transaction.atomic():
+                form.save()
+        except IntegrityError:
+            form.add_error(
+                "name",
+                ValidationError(
+                    gettext(
+                        "A saved filter with this name already exists for this form."
+                    )
+                ),
+            )
+            return self.render_form(form)
+        return None
+
+
+class SaveFormSubmissionFilterPresetView(FormSubmissionFilterPresetViewMixin, View):
+    http_method_names = ["post"]
+
+    def post(self, request, *args, **kwargs):
+        form = FormSubmissionFilterPresetForm(
+            request.POST,
+            ordering_values=request.POST.getlist("order_by"),
+            **self.get_form_kwargs(),
+        )
+        if not form.is_valid():
+            return self.render_form(form)
+        form.instance.ordering = form.cleaned_data["ordering"]
+        response = self.save_form(form)
+        if response:
+            return response
+        messages.success(request, gettext("Saved filter created."))
+        return HttpResponseRedirect(self.get_success_url(), status=303)
+
+
+class ApplyFormSubmissionFilterPresetView(FormSubmissionFilterPresetViewMixin, View):
+    http_method_names = ["get"]
+
+    def get(self, request, *args, **kwargs):
+        preset = self.filter_preset
+        try:
+            if not isinstance(preset.ordering, list):
+                raise ValidationError(gettext("Invalid ordering."))
+            ordering = validate_ordering_values(
+                preset.ordering, **self.get_ordering_configuration()
+            )
+            if (
+                preset.date_from
+                and preset.date_to
+                and preset.date_from > preset.date_to
+            ):
+                raise ValidationError(gettext("Invalid date range."))
+        except ValidationError:
+            messages.error(
+                request, gettext("The saved filter is invalid and cannot be applied.")
+            )
+            return redirect("wagtailforms:list_submissions", page_id=self.form_page.pk)
+
+        query = QueryDict("", mutable=True)
+        if preset.date_from:
+            query["date_from"] = preset.date_from.isoformat()
+        if preset.date_to:
+            query["date_to"] = preset.date_to.isoformat()
+        query.setlist("order_by", ordering)
+        url = reverse("wagtailforms:list_submissions", args=(self.form_page.pk,))
+        if encoded_query := query.urlencode():
+            url = f"{url}?{encoded_query}"
+        return redirect(url)
+
+
+class RenameFormSubmissionFilterPresetView(FormSubmissionFilterPresetViewMixin, View):
+    http_method_names = ["get", "post"]
+
+    def get_form(self):
+        return FormSubmissionFilterPresetRenameForm(
+            self.request.POST if self.request.method == "POST" else None,
+            instance=self.filter_preset,
+            **self.get_form_kwargs(),
+        )
+
+    def get(self, request, *args, **kwargs):
+        return self.render_form(self.get_form())
+
+    def post(self, request, *args, **kwargs):
+        form = self.get_form()
+        if not form.is_valid():
+            return self.render_form(form)
+        response = self.save_form(form)
+        if response:
+            return response
+        messages.success(request, gettext("Saved filter renamed."))
+        return HttpResponseRedirect(self.get_success_url(), status=303)
+
+
+class DeleteFormSubmissionFilterPresetView(FormSubmissionFilterPresetViewMixin, View):
+    http_method_names = ["get", "post"]
+
+    def get(self, request, *args, **kwargs):
+        return TemplateResponse(
+            request,
+            "wagtailforms/confirm_delete_filter_preset.html",
+            self.get_context_data(),
+        )
+
+    def post(self, request, *args, **kwargs):
+        self.filter_preset.delete()
+        messages.success(request, gettext("Saved filter deleted."))
+        return HttpResponseRedirect(self.get_success_url(), status=303)
 
 
 class SubmissionsListFilterSet(WagtailFilterSet):
@@ -365,6 +539,21 @@ class SubmissionsListView(SpreadsheetExportMixin, BaseListingView):
                     "data_rows": data_rows,
                 }
             )
+
+        if not self.is_export and not self.results_only:
+            context["filter_presets"] = FormSubmissionFilterPreset.objects.filter(
+                user=self.request.user, page=self.form_page
+            )
+            context["filter_preset_initial"] = None
+            if not self.filters or self.filters.is_valid():
+                date_range = (
+                    self.filters.form.cleaned_data.get("date") if self.filters else None
+                )
+                context["filter_preset_initial"] = {
+                    "date_from": date_range.start if date_range else None,
+                    "date_to": date_range.stop if date_range else None,
+                    "ordering": self.get_ordering(),
+                }
 
         context["next_url"] = f"{self.get_index_url()}?{self.request.GET.urlencode()}"
         return context

@@ -1,12 +1,15 @@
+import csv
 import datetime
 import html
-from io import BytesIO
+from io import BytesIO, StringIO
+from unittest.mock import patch
 
 from django.conf import settings
 from django.contrib.auth.models import AnonymousUser
 from django.contrib.contenttypes.models import ContentType
 from django.contrib.messages import get_messages
-from django.test import RequestFactory, TestCase, override_settings
+from django.db import IntegrityError
+from django.test import Client, RequestFactory, TestCase, override_settings
 from django.urls import reverse
 from django.utils.html import escape
 from django.utils.http import urlencode
@@ -14,7 +17,7 @@ from openpyxl import load_workbook
 
 from wagtail.admin.forms import WagtailAdminPageForm
 from wagtail.admin.panels import get_form_for_model
-from wagtail.contrib.forms.models import FormSubmission
+from wagtail.contrib.forms.models import FormSubmission, FormSubmissionFilterPreset
 from wagtail.contrib.forms.panels import FormSubmissionsPanel
 from wagtail.contrib.forms.tests.utils import (
     make_form_page,
@@ -700,6 +703,395 @@ class TestFormsSubmissionsList(WagtailTestUtils, TestCase):
         # check ordering matches 'submit_time' (oldest first)
         first_row_values = response.context["data_rows"][0]["fields"]
         self.assertIn("this is a really old message", first_row_values)
+
+
+class TestFormSubmissionFilterPresets(WagtailTestUtils, TestCase):
+    def setUp(self):
+        self.form_page = make_form_page()
+        self.other_form_page = make_form_page(slug="other-form-page")
+        self.user = self.create_superuser("preset-user", password="password")
+        self.other_user = self.create_superuser(
+            "other-preset-user", password="password"
+        )
+        self.login(user=self.user)
+        self.list_url = reverse(
+            "wagtailforms:list_submissions", args=(self.form_page.pk,)
+        )
+        self.save_url = reverse(
+            "wagtailforms:save_filter_preset", args=(self.form_page.pk,)
+        )
+
+    def make_preset(self, **kwargs):
+        kwargs.setdefault("user", self.user)
+        kwargs.setdefault("page", self.form_page)
+        kwargs.setdefault("name", "January")
+        kwargs.setdefault("date_from", datetime.date(2026, 1, 2))
+        kwargs.setdefault("date_to", datetime.date(2026, 1, 4))
+        kwargs.setdefault("ordering", ["-submit_time"])
+        return FormSubmissionFilterPreset.objects.create(**kwargs)
+
+    def get_url(self, action, preset=None, page=None):
+        page = page or self.form_page
+        args = [page.pk]
+        if preset is not None:
+            args.append(preset.pk)
+        return reverse(f"wagtailforms:{action}_filter_preset", args=args)
+
+    def login_client(self, client, user):
+        return client.login(
+            password="password",
+            **{user.USERNAME_FIELD: getattr(user, user.USERNAME_FIELD)},
+        )
+
+    def test_save_and_list_ui(self):
+        response = self.client.get(self.list_url)
+        self.assertContains(response, "Saved filters")
+        self.assertContains(response, self.save_url)
+
+        response = self.client.post(
+            self.save_url,
+            {
+                "name": "January",
+                "date_from": "2026-01-02",
+                "date_to": "2026-01-04",
+                "order_by": ["id", "-submit_time"],
+            },
+            follow=True,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Saved filter created.")
+        preset = FormSubmissionFilterPreset.objects.get()
+        self.assertEqual(preset.user, self.user)
+        self.assertEqual(preset.page.specific, self.form_page)
+        self.assertEqual(preset.ordering, ["id", "-submit_time"])
+        self.assertContains(response, "January")
+
+    def test_save_allows_empty_dates_and_uses_default_ordering(self):
+        response = self.client.post(self.save_url, {"name": "All submissions"})
+        self.assertEqual(response.status_code, 303)
+        preset = FormSubmissionFilterPreset.objects.get()
+        self.assertIsNone(preset.date_from)
+        self.assertIsNone(preset.date_to)
+        self.assertEqual(preset.ordering, ["-submit_time"])
+
+    def test_save_uses_only_safe_next_urls(self):
+        response = self.client.post(
+            self.save_url,
+            {"name": "Safe", "next": "https://example.com/elsewhere"},
+        )
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response["Location"], self.list_url)
+
+    def test_results_and_export_do_not_render_preset_management(self):
+        self.make_preset()
+        results_url = reverse(
+            "wagtailforms:list_submissions_results", args=(self.form_page.pk,)
+        )
+        response = self.client.get(results_url)
+        self.assertNotContains(response, "Saved filters")
+        response = self.client.get(self.list_url, {"export": "csv"})
+        self.assertNotIn(b"Saved filters", response.getvalue())
+
+    def test_invalid_current_filter_cannot_be_saved_from_ui(self):
+        response = self.client.get(self.list_url, {"date_from": "not-a-date"})
+        self.assertIsNone(response.context["filter_preset_initial"])
+        self.assertNotContains(response, 'name="order_by"')
+
+    def test_apply_builds_canonical_url(self):
+        preset = self.make_preset(ordering=["id", "-submit_time"])
+        response = self.client.get(
+            self.get_url("apply", preset),
+            {"p": "3", "export": "csv", "_w_filter_fragment": "1"},
+        )
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(
+            response["Location"],
+            f"{self.list_url}?date_from=2026-01-02&date_to=2026-01-04&order_by=id&order_by=-submit_time",
+        )
+        self.assertNotIn("p=", response["Location"])
+        self.assertNotIn("preset_id", response["Location"])
+
+    def test_apply_rejects_corrupted_ordering(self):
+        preset = self.make_preset()
+        FormSubmissionFilterPreset.objects.filter(pk=preset.pk).update(
+            ordering="-submit_time"
+        )
+        response = self.client.get(self.get_url("apply", preset), follow=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(
+            response, "The saved filter is invalid and cannot be applied."
+        )
+        self.assertEqual(response.request["PATH_INFO"], self.list_url)
+        self.assertEqual(response.request["QUERY_STRING"], "")
+
+    def test_apply_rejects_corrupted_date_range(self):
+        preset = self.make_preset(
+            date_from=datetime.date(2026, 1, 5),
+            date_to=datetime.date(2026, 1, 4),
+        )
+        response = self.client.get(self.get_url("apply", preset), follow=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(
+            response, "The saved filter is invalid and cannot be applied."
+        )
+        self.assertEqual(response.request["PATH_INFO"], self.list_url)
+        self.assertEqual(response.request["QUERY_STRING"], "")
+
+    def test_save_integrity_error_is_a_form_error(self):
+        with patch.object(
+            FormSubmissionFilterPreset, "save", side_effect=IntegrityError
+        ):
+            response = self.client.post(self.save_url, {"name": "Concurrent"})
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(
+            response, "A saved filter with this name already exists for this form."
+        )
+        self.assertFalse(FormSubmissionFilterPreset.objects.exists())
+
+    def test_rename_validation_and_success(self):
+        preset = self.make_preset()
+        other_preset = self.make_preset(name="February")
+        rename_url = self.get_url("rename", preset)
+        self.assertEqual(self.client.get(rename_url).status_code, 200)
+
+        for name in ("", "February"):
+            with self.subTest(name=name):
+                response = self.client.post(rename_url, {"name": name})
+                self.assertEqual(response.status_code, 200)
+                preset.refresh_from_db()
+                self.assertEqual(preset.name, "January")
+
+        original_ordering = preset.ordering
+        response = self.client.post(rename_url, {"name": "Renamed"})
+        self.assertEqual(response.status_code, 303)
+        preset.refresh_from_db()
+        other_preset.refresh_from_db()
+        self.assertEqual(preset.name, "Renamed")
+        self.assertEqual(preset.ordering, original_ordering)
+        self.assertEqual(other_preset.name, "February")
+
+    def test_rename_integrity_error_is_a_form_error(self):
+        preset = self.make_preset()
+        with patch.object(
+            FormSubmissionFilterPreset, "save", side_effect=IntegrityError
+        ):
+            response = self.client.post(
+                self.get_url("rename", preset), {"name": "Concurrent"}
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(
+            response, "A saved filter with this name already exists for this form."
+        )
+
+    def test_delete_requires_post_and_preserves_submissions(self):
+        preset = self.make_preset()
+        submission = FormSubmission.objects.create(
+            page=self.form_page, form_data={"your_message": "Keep me"}
+        )
+        delete_url = self.get_url("delete", preset)
+        self.assertEqual(self.client.get(delete_url).status_code, 200)
+        self.assertTrue(
+            FormSubmissionFilterPreset.objects.filter(pk=preset.pk).exists()
+        )
+
+        response = self.client.post(delete_url)
+        self.assertEqual(response.status_code, 303)
+        self.assertFalse(
+            FormSubmissionFilterPreset.objects.filter(pk=preset.pk).exists()
+        )
+        self.assertTrue(FormSubmission.objects.filter(pk=submission.pk).exists())
+        self.assertEqual(
+            self.client.get(self.get_url("apply", preset)).status_code, 404
+        )
+
+    def test_preset_is_available_in_another_session_but_not_to_another_user(self):
+        preset = self.make_preset()
+        second_client = Client()
+        self.assertTrue(self.login_client(second_client, self.user))
+        response = second_client.get(self.list_url)
+        self.assertContains(response, "<strong>January</strong>")
+        self.assertEqual(
+            second_client.get(self.get_url("apply", preset)).status_code, 302
+        )
+
+        other_client = Client()
+        self.assertTrue(self.login_client(other_client, self.other_user))
+        response = other_client.get(self.list_url)
+        self.assertNotContains(response, "<strong>January</strong>")
+        for action in ("apply", "rename", "delete"):
+            with self.subTest(action=action):
+                response = other_client.get(self.get_url(action, preset))
+                self.assertEqual(response.status_code, 404)
+        response = other_client.post(self.get_url("rename", preset), {"name": "Stolen"})
+        self.assertEqual(response.status_code, 404)
+        response = other_client.post(self.get_url("delete", preset))
+        self.assertEqual(response.status_code, 404)
+        preset.refresh_from_db()
+        self.assertEqual(preset.name, "January")
+
+    def test_preset_cannot_be_used_with_another_form(self):
+        preset = self.make_preset()
+        for action in ("apply", "rename", "delete"):
+            with self.subTest(action=action):
+                response = self.client.get(
+                    self.get_url(action, preset, page=self.other_form_page)
+                )
+                self.assertEqual(response.status_code, 404)
+        response = self.client.post(
+            self.get_url("rename", preset, page=self.other_form_page),
+            {"name": "Wrong form"},
+        )
+        self.assertEqual(response.status_code, 404)
+        response = self.client.post(
+            self.get_url("delete", preset, page=self.other_form_page)
+        )
+        self.assertEqual(response.status_code, 404)
+        preset.refresh_from_db()
+        self.assertEqual(preset.name, "January")
+
+    def test_permission_is_checked_for_every_endpoint(self):
+        preset = self.make_preset()
+
+        def construct_forms_for_user(user, queryset):
+            return queryset.none()
+
+        with self.register_hook(
+            "filter_form_submissions_for_user", construct_forms_for_user
+        ):
+            responses = [
+                self.client.post(self.save_url, {"name": "Denied"}),
+                self.client.get(self.get_url("apply", preset)),
+                self.client.get(self.get_url("rename", preset)),
+                self.client.post(self.get_url("rename", preset), {"name": "Denied"}),
+                self.client.post(self.get_url("delete", preset)),
+            ]
+        for response in responses:
+            self.assertEqual(response.status_code, 302)
+            self.assertEqual(response["Location"], "/admin/")
+        self.assertTrue(
+            FormSubmissionFilterPreset.objects.filter(pk=preset.pk).exists()
+        )
+        self.assertEqual(preset.name, "January")
+
+    def test_non_form_page_returns_404(self):
+        response = self.client.post(
+            reverse("wagtailforms:save_filter_preset", args=(2,)), {"name": "Invalid"}
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_invalid_dates_and_ordering_are_rejected(self):
+        invalid_posts = [
+            {"date_from": "not-a-date"},
+            {"date_from": "2026-02-30"},
+            {"date_from": "2026-01-05", "date_to": "2026-01-04"},
+            {"order_by": "saved_valid_order"},
+            {"order_by": "unknown"},
+            {"order_by": ""},
+        ]
+        for data in invalid_posts:
+            with self.subTest(data=data):
+                response = self.client.post(self.save_url, {"name": "Invalid", **data})
+                self.assertEqual(response.status_code, 200)
+                self.assertFalse(FormSubmissionFilterPreset.objects.exists())
+
+        response = self.client.post(
+            self.save_url,
+            {"name": "Valid", "order_by": ["id", "-id", "submit_time"]},
+        )
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(
+            FormSubmissionFilterPreset.objects.get().ordering,
+            ["id", "-id", "submit_time"],
+        )
+
+    def test_duplicate_name_is_rejected(self):
+        self.make_preset()
+        response = self.client.post(
+            self.save_url,
+            {"name": "January", "date_from": "", "date_to": ""},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(
+            response, "A saved filter with this name already exists for this form."
+        )
+        self.assertEqual(FormSubmissionFilterPreset.objects.count(), 1)
+
+    def test_real_pagination_and_exports_after_applying_preset(self):
+        messages = [
+            "outside before",
+            "普通文本",
+            "逗号,测试",
+            '双引号"测试',
+            "多行\n测试",
+            "",
+            "中文/emoji😀",
+            "终点",
+            "outside after",
+        ]
+        for index in range(1, 46):
+            submitted_at = datetime.datetime(
+                2026, 1, 3, 12, tzinfo=datetime.timezone.utc
+            )
+            if index == 1:
+                submitted_at = datetime.datetime(
+                    2026, 1, 1, 12, tzinfo=datetime.timezone.utc
+                )
+            elif index == 9:
+                submitted_at = datetime.datetime(
+                    2026, 1, 5, 12, tzinfo=datetime.timezone.utc
+                )
+            submission = FormSubmission.objects.create(
+                page=self.form_page,
+                form_data={
+                    "your_message": messages[index - 1]
+                    if index <= len(messages)
+                    else f"分页控制{index}"
+                },
+            )
+            submission.submit_time = submitted_at
+            submission.save()
+
+        preset = self.make_preset(name="一月方案")
+        for page_number, expected_size in ((1, 20), (2, 20), (3, 3)):
+            with self.subTest(page_number=page_number):
+                response = self.client.get(
+                    self.list_url,
+                    {
+                        "date_from": "2026-01-02",
+                        "date_to": "2026-01-04",
+                        "order_by": "-submit_time",
+                        "p": page_number,
+                    },
+                )
+                self.assertEqual(response.context["page_obj"].number, page_number)
+                self.assertEqual(len(response.context["object_list"]), expected_size)
+                self.assertEqual(response.context["paginator"].count, 43)
+
+        for source_page in (2, 3):
+            with self.subTest(source_page=source_page):
+                response = self.client.get(
+                    self.get_url("apply", preset), {"p": source_page}, follow=True
+                )
+                self.assertEqual(response.context["page_obj"].number, 1)
+                self.assertEqual(response.context["paginator"].count, 43)
+                applied_url = (
+                    response.request["PATH_INFO"]
+                    + "?"
+                    + response.request["QUERY_STRING"]
+                )
+
+        response = self.client.get(f"{applied_url}&export=csv")
+        rows = list(csv.reader(StringIO(response.getvalue().decode("utf-8"))))
+        self.assertEqual(len(rows), 44)
+        flattened = "\n".join(",".join(row) for row in rows)
+        for expected in ("逗号,测试", '双引号"测试', "多行\n测试", "中文/emoji😀"):
+            self.assertIn(expected, flattened)
+        self.assertNotIn("outside before", flattened)
+        self.assertNotIn("outside after", flattened)
+
+        response = self.client.get(f"{applied_url}&export=xlsx")
+        worksheet = load_workbook(filename=BytesIO(response.getvalue()))["Sheet1"]
+        self.assertEqual(worksheet.max_row, 44)
 
 
 class TestFormsSubmissionsExport(WagtailTestUtils, TestCase):

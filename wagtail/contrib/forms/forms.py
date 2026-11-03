@@ -2,11 +2,14 @@ from collections import OrderedDict
 
 import django.forms
 from django.conf import settings
+from django.core.exceptions import ValidationError
 from django.utils.html import conditional_escape
 from django.utils.translation import gettext_lazy as _
 
 from wagtail.admin.forms import WagtailAdminPageForm
 from wagtail.compat import URLField
+
+from .filter_presets import FormSubmissionFilterPreset
 
 
 def _split_by_newline_or_comma(value):
@@ -163,6 +166,94 @@ class SelectDateForm(django.forms.Form):
         required=False,
         widget=django.forms.DateInput(attrs={"placeholder": _("Date to")}),
     )
+
+
+def validate_ordering_values(values, *, orderable_fields, default_ordering):
+    """Validate ordering strings against a submissions list view's allowlist."""
+    if not values:
+        values = default_ordering
+    if isinstance(values, str):
+        values = [values]
+    if not isinstance(values, (list, tuple)) or not values:
+        raise ValidationError(_("Enter a valid ordering."))
+
+    valid_values = {
+        value for field in orderable_fields or () for value in (field, f"-{field}")
+    }
+    ordering = list(values)
+    if any(
+        not isinstance(value, str) or value not in valid_values for value in ordering
+    ):
+        raise ValidationError(_("Enter a valid ordering."))
+    return ordering
+
+
+class BaseFormSubmissionFilterPresetForm(django.forms.ModelForm):
+    def __init__(
+        self,
+        *args,
+        user,
+        page,
+        orderable_fields,
+        default_ordering,
+        ordering_values=None,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.user = user
+        self.page = page
+        self.orderable_fields = orderable_fields
+        self.default_ordering = default_ordering
+        self.ordering_values = ordering_values
+        self.instance.user = user
+        self.instance.page = page
+
+    def clean_name(self):
+        name = self.cleaned_data["name"]
+        presets = self._meta.model.objects.filter(
+            user=self.user, page=self.page, name=name
+        )
+        if self.instance.pk:
+            presets = presets.exclude(pk=self.instance.pk)
+        if presets.exists():
+            raise ValidationError(
+                _("A saved filter with this name already exists for this form.")
+            )
+        return name
+
+
+class FormSubmissionFilterPresetForm(BaseFormSubmissionFilterPresetForm):
+    class Meta:
+        model = FormSubmissionFilterPreset
+        fields = ["name", "date_from", "date_to"]
+        widgets = {
+            "date_from": django.forms.DateInput(attrs={"placeholder": _("Date from")}),
+            "date_to": django.forms.DateInput(attrs={"placeholder": _("Date to")}),
+        }
+
+    def clean(self):
+        cleaned_data = super().clean()
+        date_from = cleaned_data.get("date_from")
+        date_to = cleaned_data.get("date_to")
+        if date_from and date_to and date_from > date_to:
+            self.add_error(
+                "date_to", _("The end date must not be before the start date.")
+            )
+        try:
+            cleaned_data["ordering"] = validate_ordering_values(
+                self.ordering_values,
+                orderable_fields=self.orderable_fields,
+                default_ordering=self.default_ordering,
+            )
+        except ValidationError as error:
+            self.add_error(None, error)
+        return cleaned_data
+
+
+class FormSubmissionFilterPresetRenameForm(BaseFormSubmissionFilterPresetForm):
+    class Meta:
+        model = FormSubmissionFilterPreset
+        fields = ["name"]
 
 
 class WagtailAdminFormPageForm(WagtailAdminPageForm):
