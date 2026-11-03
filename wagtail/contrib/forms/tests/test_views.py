@@ -1,6 +1,7 @@
+import csv
 import datetime
 import html
-from io import BytesIO
+from io import BytesIO, StringIO
 
 from django.conf import settings
 from django.contrib.auth.models import AnonymousUser
@@ -21,6 +22,7 @@ from wagtail.contrib.forms.tests.utils import (
     make_form_page_with_custom_submission,
 )
 from wagtail.contrib.forms.utils import get_form_types
+from wagtail.contrib.forms.views import SubmissionsListView
 from wagtail.models import Locale
 from wagtail.test.demosite.models import FormPage as FormPageDemo
 from wagtail.test.testapp.models import (
@@ -38,6 +40,10 @@ from wagtail.test.testapp.models import (
 )
 from wagtail.test.utils import Page, PageFixturesMixin, WagtailTestUtils
 from wagtail.test.utils.form_data import inline_formset, nested_form_data
+
+
+def read_csv_rows(response):
+    return list(csv.reader(StringIO(response.getvalue().decode("utf-8"))))
 
 
 class TestFormResponsesPanel(TestCase):
@@ -489,13 +495,21 @@ class TestFormsSubmissionsList(WagtailTestUtils, TestCase):
 
     def test_export_urls_include_filters(self):
         list_url = reverse("wagtailforms:list_submissions", args=(self.form_page.id,))
+        params = {
+            "name": "Alice",
+            "date_from": "12/31/2013",
+            "date_to": "01/02/2014",
+            "order_by": "-submit_time",
+            "p": 2,
+        }
 
         # Ensure that the download URLs include the filter parameters
-        response = self.client.get(list_url, {"name": "Alice"})
+        response = self.client.get(list_url, params)
         for format in ("xlsx", "csv"):
             with self.subTest(format=format):
-                params = urlencode({"name": "Alice", "export": format})
-                expected_url = f"{list_url}?{params}"
+                export_params = params.copy()
+                export_params["export"] = format
+                expected_url = f"{list_url}?{urlencode(export_params)}"
                 self.assertContains(response, escape(expected_url))
 
     def make_list_submissions(self):
@@ -739,6 +753,239 @@ class TestFormsSubmissionsExport(WagtailTestUtils, TestCase):
         # Login
         self.login()
 
+    def get_ordering(self, params):
+        view = SubmissionsListView()
+        request = RequestFactory().get("/", params)
+        view.setup(request, form_page=self.form_page)
+        view.form_page = self.form_page
+        return view.get_ordering()
+
+    def test_validated_ordering(self):
+        cases = [
+            ({}, ["-submit_time", "-id"]),
+            ({"order_by": "submit_time"}, ["submit_time", "id"]),
+            ({"order_by": "-submit_time"}, ["-submit_time", "-id"]),
+            ({"order_by": "id"}, ["id"]),
+            ({"order_by": "-id"}, ["-id"]),
+        ]
+        for export in (None, "csv"):
+            for params, expected in cases:
+                with self.subTest(export=export, params=params):
+                    params = params.copy()
+                    if export:
+                        params["export"] = export
+                    self.assertEqual(self.get_ordering(params), expected)
+
+        # XLSX retains its legacy default and explicit ordering behavior.
+        self.assertEqual(self.get_ordering({"export": "xlsx"}), ["submit_time"])
+        self.assertEqual(
+            self.get_ordering({"export": "xlsx", "order_by": "submit_time"}),
+            ["submit_time"],
+        )
+
+    def test_list_and_csv_ordering_match(self):
+        for message in ("tie-c", "tie-a", "tie-b"):
+            self.create_form_submission(
+                {
+                    "your_email": f"{message}@example.com",
+                    "your_message": message,
+                },
+                "2014-01-02T12:00:00",
+            )
+
+        submissions = list(FormSubmission.objects.filter(page=self.form_page))
+        cases = [
+            (None, True),
+            ("submit_time", False),
+            ("-submit_time", True),
+        ]
+        url = reverse("wagtailforms:list_submissions", args=(self.form_page.id,))
+        id_by_message = {
+            submission.form_data["your_message"]: submission.id
+            for submission in submissions
+        }
+
+        for order_by, reverse_order in cases + [("id", False), ("-id", True)]:
+            with self.subTest(order_by=order_by):
+                params = {"date_from": "12/31/2012", "date_to": "01/03/2014"}
+                if order_by:
+                    params["order_by"] = order_by
+                if order_by in ("id", "-id"):
+                    expected = sorted(
+                        submissions,
+                        key=lambda submission: submission.id,
+                        reverse=reverse_order,
+                    )
+                else:
+                    expected = sorted(
+                        submissions,
+                        key=lambda submission: (submission.submit_time, submission.id),
+                        reverse=reverse_order,
+                    )
+
+                list_response = self.client.get(url, params)
+                csv_response = self.client.get(url, {**params, "export": "csv"})
+                self.assertEqual(list_response.status_code, 200)
+                self.assertEqual(csv_response.status_code, 200)
+
+                expected_ids = [submission.id for submission in expected]
+                list_ids = [
+                    row["model_id"] for row in list_response.context["data_rows"]
+                ]
+                csv_ids = [
+                    id_by_message[row[2]] for row in read_csv_rows(csv_response)[1:]
+                ]
+                self.assertEqual(list_ids, expected_ids)
+                self.assertEqual(csv_ids, expected_ids)
+
+    def test_csv_export_ignores_pagination_and_preserves_date_filter(self):
+        submissions = [
+            self.create_form_submission(
+                {
+                    "your_email": f"paged-{index}@example.com",
+                    "your_message": f"paged-{index:02d}",
+                },
+                f"2014-01-{index + 2:02d}T12:00:00",
+            )
+            for index in range(25)
+        ]
+        outside = self.create_form_submission(
+            {"your_email": "outside@example.com", "your_message": "outside"},
+            "2014-02-01T12:00:00",
+        )
+        url = reverse("wagtailforms:list_submissions", args=(self.form_page.id,))
+        params = {
+            "date_from": "01/02/2014",
+            "date_to": "01/26/2014",
+            "order_by": "submit_time",
+        }
+
+        list_ids = []
+        for page, expected_count in ((1, 20), (2, 5)):
+            response = self.client.get(url, {**params, "p": page})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(len(response.context["data_rows"]), expected_count)
+            list_ids.extend(row["model_id"] for row in response.context["data_rows"])
+
+        csv_response = self.client.get(url, {**params, "export": "csv", "p": 2})
+        self.assertEqual(csv_response.status_code, 200)
+        rows = read_csv_rows(csv_response)
+        id_by_message = {
+            submission.form_data["your_message"]: submission.id
+            for submission in submissions + [outside]
+        }
+        csv_ids = [id_by_message[row[2]] for row in rows[1:]]
+        expected_ids = [submission.id for submission in submissions]
+        self.assertEqual(list_ids, expected_ids)
+        self.assertEqual(csv_ids, expected_ids)
+        self.assertEqual(len(csv_ids), 25)
+        self.assertEqual(len(set(csv_ids)), 25)
+        self.assertNotIn(outside.id, csv_ids)
+
+    def test_csv_export_empty_result_preserves_headings(self):
+        url = reverse("wagtailforms:list_submissions", args=(self.form_page.id,))
+        normal_response = self.client.get(url, {"export": "csv"})
+        empty_response = self.client.get(
+            url,
+            {
+                "export": "csv",
+                "date_from": "01/01/2020",
+                "date_to": "01/02/2020",
+            },
+        )
+        self.assertEqual(normal_response.status_code, 200)
+        self.assertEqual(empty_response.status_code, 200)
+        normal_rows = read_csv_rows(normal_response)
+        self.assertEqual(
+            normal_rows[0],
+            ["Submission date", "Your email", "Your message", "Your choices"],
+        )
+        self.assertEqual(read_csv_rows(empty_response), [normal_rows[0]])
+
+    def test_csv_export_field_escaping_round_trip(self):
+        values = [
+            ("plain@example.com", "ordinary text", ["foo", "bar"]),
+            (
+                "escaped@example.com",
+                'comma, "quote"\n中文/emoji😀',
+                [],
+            ),
+            ("empty@example.com", "", ["single"]),
+        ]
+        for email, message, choices in values:
+            self.create_form_submission(
+                {
+                    "your_email": email,
+                    "your_message": message,
+                    "your_choices": choices,
+                },
+                "2014-01-03T12:00:00",
+            )
+
+        response = self.client.get(
+            reverse("wagtailforms:list_submissions", args=(self.form_page.id,)),
+            {
+                "export": "csv",
+                "date_from": "01/03/2014",
+                "date_to": "01/03/2014",
+                "order_by": "id",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        rows = read_csv_rows(response)
+        self.assertEqual(len(rows), len(values) + 1)
+        for row, (email, message, choices) in zip(rows[1:], values):
+            self.assertEqual(len(row), 4)
+            self.assertEqual(row[1:], [email, message, ", ".join(choices)])
+
+    def test_list_and_csv_export_share_permission_denial(self):
+        def construct_forms_for_user(user, queryset):
+            return queryset.none()
+
+        url = reverse("wagtailforms:list_submissions", args=(self.form_page.id,))
+        params = {
+            "date_from": "12/31/2013",
+            "date_to": "01/02/2014",
+            "order_by": "-submit_time",
+        }
+        with self.register_hook(
+            "filter_form_submissions_for_user", construct_forms_for_user
+        ):
+            for export in (None, "csv"):
+                with self.subTest(export=export):
+                    request_params = params.copy()
+                    if export:
+                        request_params["export"] = export
+                    response = self.client.get(url, request_params)
+                    self.assertRedirects(response, "/admin/")
+                    self.assertNotIn("new@example.com", response.content.decode())
+
+    def test_invalid_ordering_is_ignored_for_list_and_csv(self):
+        cases = [
+            (["unknown"], []),
+            (["submit_time__date"], []),
+            (["submit_time; DROP TABLE submissions"], []),
+            (["unknown", "-submit_time"], ["-submit_time", "-id"]),
+            (["id", "submit_time"], ["id", "submit_time"]),
+        ]
+        url = reverse("wagtailforms:list_submissions", args=(self.form_page.id,))
+        for export in (None, "csv"):
+            for order_by, expected in cases:
+                with self.subTest(export=export, order_by=order_by):
+                    params = {"order_by": order_by}
+                    if export:
+                        params["export"] = export
+                    self.assertEqual(self.get_ordering(params), expected)
+                    response = self.client.get(url, params)
+                    self.assertEqual(response.status_code, 200)
+                    if export:
+                        response.getvalue()
+                    else:
+                        self.assertEqual(
+                            list(response.context["submissions"].query.order_by),
+                            expected,
+                        )
+
     def test_list_submissions_csv_export(self):
         response = self.client.get(
             reverse("wagtailforms:list_submissions", args=(self.form_page.id,)),
@@ -755,20 +1002,20 @@ class TestFormsSubmissionsExport(WagtailTestUtils, TestCase):
         if settings.USE_TZ:
             self.assertEqual(
                 data_lines[1],
-                '2013-01-01 12:00:00+00:00,old@example.com,this is a really old message,"foo, baz"\r',
+                "2014-01-01 12:00:00+00:00,new@example.com,this is a fairly new message,\r",
             )
             self.assertEqual(
                 data_lines[2],
-                "2014-01-01 12:00:00+00:00,new@example.com,this is a fairly new message,\r",
+                '2013-01-01 12:00:00+00:00,old@example.com,this is a really old message,"foo, baz"\r',
             )
         else:
             self.assertEqual(
                 data_lines[1],
-                '2013-01-01 12:00:00,old@example.com,this is a really old message,"foo, baz"\r',
+                "2014-01-01 12:00:00,new@example.com,this is a fairly new message,\r",
             )
             self.assertEqual(
                 data_lines[2],
-                "2014-01-01 12:00:00,new@example.com,this is a fairly new message,\r",
+                '2013-01-01 12:00:00,old@example.com,this is a really old message,"foo, baz"\r',
             )
 
     def test_list_submissions_xlsx_export(self):
@@ -872,20 +1119,20 @@ class TestFormsSubmissionsExport(WagtailTestUtils, TestCase):
         if settings.USE_TZ:
             self.assertEqual(
                 data_lines[1],
-                '2013-01-01 12:00:00+00:00,old@example.com,this is a really old message,"foo, baz"\r',
+                "2014-01-01 12:00:00+00:00,new@example.com,this is a fairly new message,\r",
             )
             self.assertEqual(
                 data_lines[2],
-                "2014-01-01 12:00:00+00:00,new@example.com,this is a fairly new message,\r",
+                '2013-01-01 12:00:00+00:00,old@example.com,this is a really old message,"foo, baz"\r',
             )
         else:
             self.assertEqual(
                 data_lines[1],
-                '2013-01-01 12:00:00,old@example.com,this is a really old message,"foo, baz"\r',
+                "2014-01-01 12:00:00,new@example.com,this is a fairly new message,\r",
             )
             self.assertEqual(
                 data_lines[2],
-                "2014-01-01 12:00:00,new@example.com,this is a fairly new message,\r",
+                '2013-01-01 12:00:00,old@example.com,this is a really old message,"foo, baz"\r',
             )
 
         with self.register_hook(
@@ -1085,20 +1332,20 @@ class TestCustomFormsSubmissionsExport(WagtailTestUtils, TestCase):
         if settings.USE_TZ:
             self.assertEqual(
                 data_lines[1],
-                "user-john@example.com,2013-01-01 12:00:00+00:00,old@example.com,this is a really old message,\r",
+                "user-m1kola@example.com,2014-01-01 12:00:00+00:00,new@example.com,this is a fairly new message,\r",
             )
             self.assertEqual(
                 data_lines[2],
-                "user-m1kola@example.com,2014-01-01 12:00:00+00:00,new@example.com,this is a fairly new message,\r",
+                "user-john@example.com,2013-01-01 12:00:00+00:00,old@example.com,this is a really old message,\r",
             )
         else:
             self.assertEqual(
                 data_lines[1],
-                "user-john@example.com,2013-01-01 12:00:00,old@example.com,this is a really old message,\r",
+                "user-m1kola@example.com,2014-01-01 12:00:00,new@example.com,this is a fairly new message,\r",
             )
             self.assertEqual(
                 data_lines[2],
-                "user-m1kola@example.com,2014-01-01 12:00:00,new@example.com,this is a fairly new message,\r",
+                "user-john@example.com,2013-01-01 12:00:00,old@example.com,this is a really old message,\r",
             )
 
     def test_list_submissions_csv_export_with_date_from_filtering(self):
@@ -1819,25 +2066,63 @@ class TestFormsWithCustomSubmissionsList(WagtailTestUtils, TestCase):
             data_lines[0],
             "User email,Submission date,Your email,Chocolate,Ingredients,Your Excitement\r",
         )
-        # first result should be the most recent as order_csv has been reversed
+        # CSV uses the custom list view's ascending default ordering.
         if settings.USE_TZ:
             self.assertEqual(
                 data_lines[1],
-                "user-chocolate-maniac@example.com,2017-10-01 12:00:00+00:00,new@example.com,White Chocolate,White colouring,Much excitement\r",
+                "user-chocolate-guy@example.com,2017-01-01 12:00:00+00:00,old@example.com,Dark Chocolate,Charcoal,What is chocolate?\r",
             )
             self.assertEqual(
                 data_lines[2],
-                "user-chocolate-guy@example.com,2017-01-01 12:00:00+00:00,old@example.com,Dark Chocolate,Charcoal,What is chocolate?\r",
+                "user-chocolate-maniac@example.com,2017-10-01 12:00:00+00:00,new@example.com,White Chocolate,White colouring,Much excitement\r",
             )
         else:
             self.assertEqual(
                 data_lines[1],
-                "user-chocolate-maniac@example.com,2017-10-01 12:00:00,new@example.com,White Chocolate,White colouring,Much excitement\r",
+                "user-chocolate-guy@example.com,2017-01-01 12:00:00,old@example.com,Dark Chocolate,Charcoal,What is chocolate?\r",
             )
             self.assertEqual(
                 data_lines[2],
-                "user-chocolate-guy@example.com,2017-01-01 12:00:00,old@example.com,Dark Chocolate,Charcoal,What is chocolate?\r",
+                "user-chocolate-maniac@example.com,2017-10-01 12:00:00,new@example.com,White Chocolate,White colouring,Much excitement\r",
             )
+
+    def test_list_submissions_csv_export_matches_list_order(self):
+        old_submission = (
+            CustomFormPageSubmission.objects.filter(page=self.form_page)
+            .order_by("submit_time")
+            .first()
+        )
+        tied_submission = CustomFormPageSubmission.objects.create(
+            page=self.form_page,
+            user=self.test_user_1,
+            form_data={
+                "your_email": "tied@example.com",
+                "chocolate": "Milk Chocolate",
+                "ingredients": "Milk",
+                "your_excitement": self.choices[1],
+            },
+        )
+        tied_submission.submit_time = old_submission.submit_time
+        tied_submission.save()
+        expected = list(
+            CustomFormPageSubmission.objects.filter(page=self.form_page).order_by(
+                "submit_time", "id"
+            )
+        )
+        url = reverse("wagtailforms:list_submissions", args=(self.form_page.id,))
+
+        list_response = self.client.get(url)
+        csv_response = self.client.get(url, {"export": "csv"})
+        self.assertEqual(list_response.status_code, 200)
+        self.assertEqual(csv_response.status_code, 200)
+        self.assertEqual(
+            [row["model_id"] for row in list_response.context["data_rows"]],
+            [submission.id for submission in expected],
+        )
+        self.assertEqual(
+            [row[3] for row in read_csv_rows(csv_response)[1:]],
+            [submission.form_data["chocolate"] for submission in expected],
+        )
 
     def test_list_submissions_ordering(self):
         form_submission = CustomFormPageSubmission.objects.create(

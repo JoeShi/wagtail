@@ -209,8 +209,8 @@ class SubmissionsListView(SpreadsheetExportMixin, BaseListingView):
     results_template_name = "wagtailforms/list_submissions.html"
     context_object_name = "submissions"
     form_page = None
-    default_ordering = ("-submit_time",)
-    ordering_csv = ("submit_time",)  # keep legacy CSV ordering
+    default_ordering = ("-submit_time", "-id")
+    ordering_csv = ("submit_time",)  # keep legacy XLSX ordering
     orderable_fields = (
         "id",
         "submit_time",
@@ -253,8 +253,9 @@ class SubmissionsListView(SpreadsheetExportMixin, BaseListingView):
         """Return a dict of field names with ordering labels if ordering is valid"""
         orderable_fields = self.orderable_fields or ()
         ordering = {}
-        if self.is_export:
-            #  Revert to CSV order_by submit_time ascending for backwards compatibility
+        is_csv_export = self.request.GET.get("export") == self.FORMAT_CSV
+        if self.is_export and not is_csv_export:
+            # Revert to XLSX order_by submit_time ascending for backwards compatibility
             default_ordering = self.ordering_csv or ()
         else:
             default_ordering = self.default_ordering or ()
@@ -271,6 +272,15 @@ class SubmissionsListView(SpreadsheetExportMixin, BaseListingView):
                     )
             except (IndexError, ValueError):
                 continue  # invalid ordering specified, skip it
+        if (
+            "submit_time" in ordering
+            and "id" not in ordering
+            and (not self.is_export or is_csv_export)
+        ):
+            ordering["id"] = (
+                ordering["submit_time"][0],
+                ordering["submit_time"][1],
+            )
         return ordering
 
     def get_ordering(self):
